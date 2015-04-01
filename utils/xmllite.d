@@ -18,6 +18,8 @@ module ae.utils.xmllite;
 
 // TODO: better/safer handling of malformed XML
 
+import std.array;
+import std.algorithm;
 import std.stream;
 import std.string;
 import std.ascii;
@@ -46,6 +48,23 @@ private struct StringStream
 
 // ************************************************************************
 
+class XmlNamespace
+{
+	string name, prefix;
+
+	this(string prefix, string name)
+	{
+		this.name = name;
+		this.prefix = prefix;
+	}
+}
+
+private struct ParserContext
+{
+	XmlNamespace globalNamespace;
+	XmlNamespace[string] prefixedNamespaces;
+}
+
 enum XmlNodeType
 {
 	Root,
@@ -62,13 +81,19 @@ class XmlNode
 	string[string] attributes;
 	XmlNode[] children;
 	XmlNodeType type;
+    XmlNamespace namespace;
 	ulong startPos, endPos;
 
 	this(Stream        s) { parse(s); }
 	this(StringStream* s) { parse(s); }
 	this(string s) { this(new StringStream(s)); }
 
-	private final void parse(S)(S s)
+	private this(S)(S s, ParserContext ctx)
+	{
+		parse(s, ctx);
+	}
+
+	private final void parse(S)(S s, ParserContext ctx = ParserContext())
 	{
 		startPos = s.position;
 		char c;
@@ -148,6 +173,49 @@ class XmlNode
 						break;
 					readAttribute(s);
 				}
+
+				// Check if any global or any prefixed namespaces are defined for the
+				// subtree
+				ParserContext subTreeContext = ctx;
+				foreach (name, value; this.attributes)
+				{
+					if (name == "xmlns")
+					{
+						subTreeContext.globalNamespace = new XmlNamespace("", value);
+					}
+					else if (name.startsWith("xmlns:"))
+					{
+						enforce(name.length > 6);
+
+						string namespacePrefix = name[6..$];
+						string namespaceName = value;
+
+						subTreeContext.prefixedNamespaces[namespacePrefix] =
+							new XmlNamespace(namespacePrefix, namespaceName);
+					}
+				}
+
+				// Check if the tag name starts with a namespace prefix - otherwise use the global namespace
+				// if there has been one
+				if (tag.canFind(':'))
+				{
+					auto prefixAndTag = tag.findSplit(":");
+
+					string namespacePrefix = prefixAndTag[0];
+
+					if (namespacePrefix in subTreeContext.prefixedNamespaces)
+					{
+						namespace = subTreeContext.prefixedNamespaces[namespacePrefix];
+						tag = prefixAndTag[2];
+					}
+				}
+
+				// Apply global namespace to the element
+				if (this.namespace is null && subTreeContext.globalNamespace !is null)
+				{
+					this.namespace = subTreeContext.globalNamespace;
+				}
+
 				s.read(c);
 				if (c=='>')
 				{
@@ -157,12 +225,22 @@ class XmlNode
 						if (peek(s)=='<' && peek(s, 2)=='/')
 							break;
 						try
-							children ~= new XmlNode(s);
+							children ~= new XmlNode(s, subTreeContext);
 						catch (Exception e)
 							throw new Exception("Error while processing child of "~tag, e);
 					}
 					expect(s, '<');
 					expect(s, '/');
+
+					if (namespace !is null && !namespace.prefix.empty)
+					{
+						foreach (pc; namespace.prefix)
+						{
+							expect(s, pc);
+						}
+						expect(s, ':');
+					}
+
 					foreach (tc; tag)
 						expect(s, tc);
 					expect(s, '>');
@@ -219,11 +297,28 @@ class XmlNode
 				writeChildren();
 				return;
 			case XmlNodeType.Node:
-				output.startTagWithAttributes(tag);
+				bool prefixedNamespace = namespace !is null && !namespace.prefix.empty;
+
+				if (prefixedNamespace)
+				{
+					output.startTagWithAttributes(namespace.prefix ~ ":" ~ tag);
+				}
+				else
+				{
+					output.startTagWithAttributes(tag);
+				}
 				writeAttributes();
 				output.endAttributes();
 				writeChildren();
-				output.endTag(tag);
+				if (prefixedNamespace)
+				{
+					output.endTag(namespace.prefix ~ ":" ~ tag);
+				}
+				else
+				{
+					output.endTag(tag);
+				}
+
 				return;
 			case XmlNodeType.Meta:
 				assert(children.length == 0);
@@ -318,6 +413,7 @@ class XmlNode
 		auto result = new XmlNode(type, tag);
 		result.attributes = attributes.dup;
 		result.children.length = children.length;
+        result.namespace = namespace;
 		foreach (i, child; children)
 			result.children[i] = child.dup;
 		return result;
@@ -484,6 +580,35 @@ unittest
 	assert(doc.toString() == xmlText);
 	doc = new XmlDocument(xmlText);
 	assert(doc.toString() == xmlText);
+}
+
+unittest
+{
+	enum xmlText =
+		`<?xml version="1.0" encoding="UTF-8"?>`
+		`<quotes xmlns="foo">`
+			`<quote xmlns:prefix="name" author="Alan Perlis">`
+				`When someone says, &quot;I want a programming language in which I need only say what I want done,&quot; give him a lollipop.`
+				`<prefix:prefixed_element>Hello</prefix:prefixed_element>`
+			`</quote>`
+			`<prefix:subtree xmlns:prefix="subtree_prefix">`
+				`<prefix:node>XYZ</prefix:node>`
+			`</prefix:subtree>`
+		`</quotes>`;
+
+	auto doc = new XmlDocument(xmlText);
+	assert(doc.toString() == xmlText);
+
+	auto root = doc.children.filter!(node => node.type == XmlNodeType.Node).front;
+	assert(root.namespace.name == "foo");
+	assert(root.namespace.prefix == "");
+
+	auto quote = root["quote"];
+	assert(quote.namespace == root.namespace);
+
+	auto prefixed_element = quote["prefixed_element"];
+	assert(prefixed_element.namespace.name == "name");
+	assert(prefixed_element.namespace.prefix == "prefix");
 }
 
 const dchar[string] entities;
